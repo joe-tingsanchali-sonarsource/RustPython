@@ -258,6 +258,17 @@ impl Frame {
         }
     }
 
+    pub fn set_lasti(&self, val: u32) {
+        #[cfg(feature = "threading")]
+        {
+            self.lasti.store(val, atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "threading"))]
+        {
+            self.lasti.set(val);
+        }
+    }
+
     /// Sync locals dict back to fastlocals. Called before generator/coroutine resume
     /// to apply any modifications made via f_locals.
     pub fn locals_to_fast(&self, vm: &VirtualMachine) -> PyResult<()> {

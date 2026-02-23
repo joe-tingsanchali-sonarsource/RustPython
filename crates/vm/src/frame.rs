@@ -500,7 +500,6 @@ impl ExecutingFrame<'_> {
             let arg = arg_state.extend(arg);
             let mut do_extend_arg = false;
 
-            // Track current line for settrace LINE event and monitoring.
             if !matches!(
                 op,
                 Instruction::Resume { .. }
@@ -598,10 +597,7 @@ impl ExecutingFrame<'_> {
                     );
 
                     // Fire RAISE or RERAISE monitoring event.
-                    // fire_reraise internally deduplicates: only the first
-                    // re-raise after each EXCEPTION_HANDLED fires the event.
-                    // If the callback raises (e.g. ValueError for illegal DISABLE),
-                    // replace the original exception.
+                    // If the callback raises, replace the original exception.
                     let exception = {
                         use crate::stdlib::sys::monitoring;
                         let mon_events = vm.state.monitoring_events.load();
@@ -826,9 +822,8 @@ impl ExecutingFrame<'_> {
             exception.set_traceback_typed(Some(new_traceback.into_ref(&vm.ctx)));
         }
 
-        // Fire PY_THROW and RAISE events before raising the exception in the
-        // generator.  do_monitor_exc in CPython replaces the active exception
-        // when a callback fails, so we mirror that here.
+        // Fire PY_THROW and RAISE events before raising the exception.
+        // If a monitoring callback fails, its exception replaces the original.
         let exception = {
             use crate::stdlib::sys::monitoring;
             let mon_events = vm.state.monitoring_events.load();
@@ -867,7 +862,6 @@ impl ExecutingFrame<'_> {
             Ok(Some(result)) => Ok(result),
             Err(exception) => {
                 // Fire PY_UNWIND: exception escapes the generator frame.
-                // do_monitor_exc replaces the exception on callback failure.
                 let exception = if vm.state.monitoring_events.load()
                     & crate::stdlib::sys::monitoring::EVENT_PY_UNWIND
                     != 0
@@ -2155,10 +2149,8 @@ impl ExecutingFrame<'_> {
                     vm.set_exception(Some(exc_ref.to_owned()));
                 }
 
-                // Complete stack operations
                 self.push_value(prev_exc);
                 self.push_value(exc);
-
                 Ok(None)
             }
             Instruction::CheckExcMatch => {
@@ -2465,9 +2457,6 @@ impl ExecutingFrame<'_> {
             instruction.is_instrumented(),
             "execute_instrumented called with non-instrumented opcode {instruction:?}"
         );
-        // Refresh monitoring mask from global state on every instrumented opcode
-        // execution. This ensures frames already past RESUME pick up events that
-        // were enabled by a set_events() call while the frame was executing.
         self.monitoring_mask = vm.state.monitoring_events.load();
         use crate::stdlib::sys::monitoring;
         match instruction {
@@ -2641,55 +2630,50 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             Instruction::InstrumentedPopJumpIfTrue => {
+                let src_offset = (self.lasti() - 1) * 2;
                 let target = bytecode::Label::from(u32::from(arg));
                 let obj = self.pop_value();
                 let value = obj.try_to_bool(vm)?;
                 if value {
                     self.jump(target);
-                    // Branch taken → fire BRANCH_RIGHT
                     if self.monitoring_mask & monitoring::EVENT_BRANCH_RIGHT != 0 {
-                        let src_offset = (self.lasti() - 1) * 2;
                         monitoring::fire_branch_right(vm, self.code, src_offset, target.0 * 2)?;
                     }
                 }
-                // Branch not taken → InstrumentedNotTaken fires BRANCH_LEFT
                 Ok(None)
             }
             Instruction::InstrumentedPopJumpIfFalse => {
+                let src_offset = (self.lasti() - 1) * 2;
                 let target = bytecode::Label::from(u32::from(arg));
                 let obj = self.pop_value();
                 let value = obj.try_to_bool(vm)?;
                 if !value {
                     self.jump(target);
-                    // Branch taken → fire BRANCH_RIGHT
                     if self.monitoring_mask & monitoring::EVENT_BRANCH_RIGHT != 0 {
-                        let src_offset = (self.lasti() - 1) * 2;
                         monitoring::fire_branch_right(vm, self.code, src_offset, target.0 * 2)?;
                     }
                 }
                 Ok(None)
             }
             Instruction::InstrumentedPopJumpIfNone => {
+                let src_offset = (self.lasti() - 1) * 2;
                 let value = self.pop_value();
                 let target = bytecode::Label::from(u32::from(arg));
                 if vm.is_none(&value) {
                     self.jump(target);
-                    // Branch taken → fire BRANCH_RIGHT
                     if self.monitoring_mask & monitoring::EVENT_BRANCH_RIGHT != 0 {
-                        let src_offset = (self.lasti() - 1) * 2;
                         monitoring::fire_branch_right(vm, self.code, src_offset, target.0 * 2)?;
                     }
                 }
                 Ok(None)
             }
             Instruction::InstrumentedPopJumpIfNotNone => {
+                let src_offset = (self.lasti() - 1) * 2;
                 let value = self.pop_value();
                 let target = bytecode::Label::from(u32::from(arg));
                 if !vm.is_none(&value) {
                     self.jump(target);
-                    // Branch taken → fire BRANCH_RIGHT
                     if self.monitoring_mask & monitoring::EVENT_BRANCH_RIGHT != 0 {
-                        let src_offset = (self.lasti() - 1) * 2;
                         monitoring::fire_branch_right(vm, self.code, src_offset, target.0 * 2)?;
                     }
                 }
@@ -3254,9 +3238,7 @@ impl ExecutingFrame<'_> {
         let self_or_null = self.pop_value_opt(); // Option<PyObjectRef>
         let callable = self.pop_value();
 
-        // If self_or_null is Some (not NULL), prepend it to args
         let final_args = if let Some(self_val) = self_or_null {
-            // Method call: prepend self to args
             let mut all_args = vec![self_val];
             all_args.extend(args.args);
             FuncArgs {
@@ -3264,28 +3246,21 @@ impl ExecutingFrame<'_> {
                 kwargs: args.kwargs,
             }
         } else {
-            // Regular attribute call: self_or_null is NULL
             args
         };
 
-        match callable.call(final_args, vm) {
-            Ok(value) => {
-                self.push_value(value);
-                Ok(None)
-            }
-            Err(exc) => Err(exc),
-        }
+        let value = callable.call(final_args, vm)?;
+        self.push_value(value);
+        Ok(None)
     }
 
     /// Instrumented version of execute_call: fires CALL, C_RETURN, and C_RAISE events.
     fn execute_call_instrumented(&mut self, args: FuncArgs, vm: &VirtualMachine) -> FrameResult {
         use crate::stdlib::sys::monitoring;
 
-        // Stack: [callable, self_or_null, ...]
-        let self_or_null = self.pop_value_opt(); // Option<PyObjectRef>
+        let self_or_null = self.pop_value_opt();
         let callable = self.pop_value();
 
-        // If self_or_null is Some (not NULL), prepend it to args
         let final_args = if let Some(self_val) = self_or_null {
             let mut all_args = vec![self_val];
             all_args.extend(args.args);
@@ -3498,8 +3473,7 @@ impl ExecutingFrame<'_> {
                 Ok(true)
             }
             Ok(PyIterReturn::StopIteration(_)) => {
-                // Skip END_FOR if followed by POP_ITER (both base and instrumented).
-                // PopIter may be further wrapped by InstrumentedInstruction / InstrumentedLine.
+                // Skip END_FOR (base or instrumented) and jump to POP_ITER.
                 let target_idx = target.0 as usize;
                 let jump_target = if let Some(unit) = self.code.instructions.get(target_idx) {
                     if matches!(

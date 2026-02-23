@@ -914,6 +914,71 @@ impl PyCode {
     }
 
     #[pymethod]
+    pub fn co_branches(&self, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        use bytecode::Instruction;
+
+        let instructions = &self.code.instructions;
+        let mut branches = Vec::new();
+        let mut extended_arg: u32 = 0;
+
+        for (i, unit) in instructions.iter().enumerate() {
+            // De-instrument: use base opcode for instrumented variants
+            let op = unit.op.to_base().unwrap_or(unit.op);
+            let raw_arg = u32::from(u8::from(unit.arg));
+
+            if matches!(op, Instruction::ExtendedArg) {
+                extended_arg = (extended_arg | raw_arg) << 8;
+                continue;
+            }
+
+            let oparg = extended_arg | raw_arg;
+            extended_arg = 0;
+
+            let (src, left, right) = match op {
+                Instruction::ForIter { .. } => {
+                    // left = fall-through (continue iteration)
+                    // right = past END_FOR (iterator exhausted, skip cleanup)
+                    let target = oparg as usize;
+                    let right = if matches!(
+                        instructions.get(target).map(|u| u.op),
+                        Some(Instruction::EndFor) | Some(Instruction::InstrumentedEndFor)
+                    ) {
+                        (target + 1) * 2
+                    } else {
+                        target * 2
+                    };
+                    (i * 2, (i + 1) * 2, right)
+                }
+                Instruction::PopJumpIfFalse { .. }
+                | Instruction::PopJumpIfTrue { .. }
+                | Instruction::PopJumpIfNone { .. }
+                | Instruction::PopJumpIfNotNone { .. } => {
+                    // left = skip NOT_TAKEN (fall-through)
+                    // right = jump target (condition met)
+                    (i * 2, (i + 2) * 2, oparg as usize * 2)
+                }
+                Instruction::EndAsyncFor => {
+                    // src = END_SEND position (next_i - oparg)
+                    let next_i = i + 1;
+                    let src_i = next_i - oparg as usize;
+                    (src_i * 2, (src_i + 2) * 2, next_i * 2)
+                }
+                _ => continue,
+            };
+
+            let tuple = vm.ctx.new_tuple(vec![
+                vm.ctx.new_int(src).into(),
+                vm.ctx.new_int(left).into(),
+                vm.ctx.new_int(right).into(),
+            ]);
+            branches.push(tuple.into());
+        }
+
+        let list = vm.ctx.new_list(branches);
+        vm.call_method(list.as_object(), "__iter__", ())
+    }
+
+    #[pymethod]
     pub fn replace(&self, args: ReplaceArgs, vm: &VirtualMachine) -> PyResult<Self> {
         let ReplaceArgs {
             co_posonlyargcount,

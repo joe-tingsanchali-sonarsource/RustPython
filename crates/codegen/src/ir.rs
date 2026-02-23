@@ -519,10 +519,8 @@ impl CodeInfo {
                 let tuple_const = ConstantData::Tuple { elements };
                 let (const_idx, _) = self.metadata.consts.insert_full(tuple_const);
 
-                // Replace preceding LOAD instructions with NOP, using the
-                // BUILD_TUPLE location so remove_nops() treats them as
-                // same-line and removes them (multi-line tuple literals
-                // would otherwise leave line-introducing NOPs behind).
+                // Replace preceding LOAD instructions with NOP at the
+                // BUILD_TUPLE location so remove_nops() can eliminate them.
                 let folded_loc = block.instructions[i].location;
                 for j in start_idx..i {
                     block.instructions[j].instr = Instruction::Nop.into();

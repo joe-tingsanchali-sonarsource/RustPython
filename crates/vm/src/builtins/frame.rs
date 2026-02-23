@@ -87,27 +87,19 @@ impl Frame {
             }
         };
 
-        // Find the first instruction at the target line
-        let locations = &self.code.locations;
-        let mut target_idx = None;
-        for (idx, (loc, _)) in locations.iter().enumerate() {
-            if loc.line.get() == target_line {
-                target_idx = Some(idx);
-                break;
-            }
-        }
+        let target_idx = self
+            .code
+            .locations
+            .iter()
+            .position(|(loc, _)| loc.line.get() == target_line);
 
-        match target_idx {
-            Some(idx) => {
-                // Set lasti to point to the target instruction.
-                // The run loop reads lasti then increments, so set to idx
-                // so the next iteration executes instruction at idx.
-                self.set_lasti(idx as u32);
-                Ok(())
-            }
-            None => Err(vm.new_value_error(format!(
+        if let Some(idx) = target_idx {
+            self.set_lasti(idx as u32);
+            Ok(())
+        } else {
+            Err(vm.new_value_error(format!(
                 "line {target_line} comes after the current code block"
-            ))),
+            )))
         }
     }
 

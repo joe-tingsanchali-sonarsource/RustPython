@@ -466,9 +466,6 @@ impl Instruction {
     ///
     /// The returned base opcode uses `Arg::marker()` for typed fields —
     /// only the opcode byte matters since `replace_op` preserves the arg byte.
-    ///
-    /// # Panics (debug)
-    /// Panics if called on a base opcode that has an instrumented counterpart.
     pub fn to_base(self) -> Option<Self> {
         Some(match self {
             Self::InstrumentedResume => Self::Resume { arg: Arg::marker() },

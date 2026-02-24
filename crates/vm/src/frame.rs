@@ -258,6 +258,17 @@ impl Frame {
         }
     }
 
+    pub fn set_lasti(&self, val: u32) {
+        #[cfg(feature = "threading")]
+        {
+            self.lasti.store(val, atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "threading"))]
+        {
+            self.lasti.set(val);
+        }
+    }
+
     /// Sync locals dict back to fastlocals. Called before generator/coroutine resume
     /// to apply any modifications made via f_locals.
     pub fn locals_to_fast(&self, vm: &VirtualMachine) -> PyResult<()> {
@@ -333,6 +344,8 @@ impl Py<Frame> {
             lasti: &self.lasti,
             object: self,
             state: &mut state,
+            monitoring_mask: 0,
+            prev_line: 0,
         };
         f(exec)
     }
@@ -379,6 +392,8 @@ impl Py<Frame> {
             lasti: &self.lasti,
             object: self,
             state: &mut state,
+            monitoring_mask: 0,
+            prev_line: 0,
         };
         exec.yield_from_target().map(PyObject::to_owned)
     }
@@ -414,6 +429,10 @@ struct ExecutingFrame<'a> {
     object: &'a Py<Frame>,
     lasti: &'a Lasti,
     state: &'a mut FrameState,
+    /// Cached monitoring events mask. Reloaded at Resume instruction only,
+    monitoring_mask: u32,
+    /// Previous line number for LINE event suppression.
+    prev_line: u32,
 }
 
 impl fmt::Debug for ExecutingFrame<'_> {
@@ -463,7 +482,6 @@ impl ExecutingFrame<'_> {
         // Execute until return or exception:
         let instructions = &self.code.instructions;
         let mut arg_state = bytecode::OpArgState::default();
-        let mut prev_line: u32 = 0;
         loop {
             let idx = self.lasti() as usize;
             // Fire 'line' trace event when line number changes.
@@ -472,15 +490,26 @@ impl ExecutingFrame<'_> {
             if vm.use_tracing.get()
                 && !vm.is_none(&self.object.trace.lock())
                 && let Some((loc, _)) = self.code.locations.get(idx)
-                && loc.line.get() as u32 != prev_line
+                && loc.line.get() as u32 != self.prev_line
             {
-                prev_line = loc.line.get() as u32;
+                self.prev_line = loc.line.get() as u32;
                 vm.trace_event(crate::protocol::TraceEvent::Line, None)?;
             }
             self.update_lasti(|i| *i += 1);
             let bytecode::CodeUnit { op, arg } = instructions[idx];
             let arg = arg_state.extend(arg);
             let mut do_extend_arg = false;
+
+            if !matches!(
+                op,
+                Instruction::Resume { .. }
+                    | Instruction::ExtendedArg
+                    | Instruction::InstrumentedLine
+            ) && let Some((loc, _)) = self.code.locations.get(idx)
+            {
+                self.prev_line = loc.line.get() as u32;
+            }
+
             let result = self.execute_instruction(op, arg, &mut do_extend_arg, vm);
             match result {
                 Ok(None) => {}
@@ -567,10 +596,55 @@ impl ExecutingFrame<'_> {
                             )
                     );
 
+                    // Fire RAISE or RERAISE monitoring event.
+                    // If the callback raises, replace the original exception.
+                    let exception = {
+                        use crate::stdlib::sys::monitoring;
+                        let mon_events = vm.state.monitoring_events.load();
+                        if is_reraise {
+                            if mon_events & monitoring::EVENT_RERAISE != 0 {
+                                let offset = idx as u32 * 2;
+                                let exc_obj: PyObjectRef = exception.clone().into();
+                                match monitoring::fire_reraise(vm, self.code, offset, &exc_obj) {
+                                    Ok(()) => exception,
+                                    Err(monitor_exc) => monitor_exc,
+                                }
+                            } else {
+                                exception
+                            }
+                        } else if mon_events & monitoring::EVENT_RAISE != 0 {
+                            let offset = idx as u32 * 2;
+                            let exc_obj: PyObjectRef = exception.clone().into();
+                            match monitoring::fire_raise(vm, self.code, offset, &exc_obj) {
+                                Ok(()) => exception,
+                                Err(monitor_exc) => monitor_exc,
+                            }
+                        } else {
+                            exception
+                        }
+                    };
+
                     match handle_exception(self, exception, idx, is_reraise, is_new_raise, vm) {
                         Ok(None) => {}
                         Ok(Some(result)) => break Ok(result),
                         Err(exception) => {
+                            // Fire PY_UNWIND: exception escapes this frame
+                            let exception = if vm.state.monitoring_events.load()
+                                & crate::stdlib::sys::monitoring::EVENT_PY_UNWIND
+                                != 0
+                            {
+                                let offset = idx as u32 * 2;
+                                let exc_obj: PyObjectRef = exception.clone().into();
+                                match crate::stdlib::sys::monitoring::fire_py_unwind(
+                                    vm, self.code, offset, &exc_obj,
+                                ) {
+                                    Ok(()) => exception,
+                                    Err(monitor_exc) => monitor_exc,
+                                }
+                            } else {
+                                exception
+                            };
+
                             // Restore lasti from traceback so frame.f_lineno matches tb_lineno
                             // The traceback was created with the correct lasti when exception
                             // was first raised, but frame.lasti may have changed during cleanup
@@ -637,6 +711,7 @@ impl ExecutingFrame<'_> {
         exc_val: PyObjectRef,
         exc_tb: PyObjectRef,
     ) -> PyResult<ExecutionResult> {
+        self.monitoring_mask = vm.state.monitoring_events.load();
         if let Some(jen) = self.yield_from_target() {
             // Check if the exception is GeneratorExit (type or instance).
             // For GeneratorExit, close the sub-iterator instead of throwing.
@@ -747,6 +822,33 @@ impl ExecutingFrame<'_> {
             exception.set_traceback_typed(Some(new_traceback.into_ref(&vm.ctx)));
         }
 
+        // Fire PY_THROW and RAISE events before raising the exception.
+        // If a monitoring callback fails, its exception replaces the original.
+        let exception = {
+            use crate::stdlib::sys::monitoring;
+            let mon_events = vm.state.monitoring_events.load();
+            let exception = if mon_events & monitoring::EVENT_PY_THROW != 0 {
+                let offset = idx as u32 * 2;
+                let exc_obj: PyObjectRef = exception.clone().into();
+                match monitoring::fire_py_throw(vm, self.code, offset, &exc_obj) {
+                    Ok(()) => exception,
+                    Err(monitor_exc) => monitor_exc,
+                }
+            } else {
+                exception
+            };
+            if mon_events & monitoring::EVENT_RAISE != 0 {
+                let offset = idx as u32 * 2;
+                let exc_obj: PyObjectRef = exception.clone().into();
+                match monitoring::fire_raise(vm, self.code, offset, &exc_obj) {
+                    Ok(()) => exception,
+                    Err(monitor_exc) => monitor_exc,
+                }
+            } else {
+                exception
+            }
+        };
+
         // when raising an exception, set __context__ to the current exception
         // This is done in _PyErr_SetObject
         vm.contextualize_exception(&exception);
@@ -758,7 +860,25 @@ impl ExecutingFrame<'_> {
         match self.unwind_blocks(vm, UnwindReason::Raising { exception }) {
             Ok(None) => self.run(vm),
             Ok(Some(result)) => Ok(result),
-            Err(exception) => Err(exception),
+            Err(exception) => {
+                // Fire PY_UNWIND: exception escapes the generator frame.
+                let exception = if vm.state.monitoring_events.load()
+                    & crate::stdlib::sys::monitoring::EVENT_PY_UNWIND
+                    != 0
+                {
+                    let offset = idx as u32 * 2;
+                    let exc_obj: PyObjectRef = exception.clone().into();
+                    match crate::stdlib::sys::monitoring::fire_py_unwind(
+                        vm, self.code, offset, &exc_obj,
+                    ) {
+                        Ok(()) => exception,
+                        Err(monitor_exc) => monitor_exc,
+                    }
+                } else {
+                    exception
+                };
+                Err(exception)
+            }
         }
     }
 
@@ -1160,7 +1280,10 @@ impl ExecutingFrame<'_> {
                 *extend_arg = true;
                 Ok(None)
             }
-            Instruction::ForIter { target } => self.execute_for_iter(vm, target.get(arg)),
+            Instruction::ForIter { target } => {
+                self.execute_for_iter(vm, target.get(arg))?;
+                Ok(None)
+            }
             Instruction::FormatSimple => {
                 let value = self.pop_value();
                 let formatted = vm.format(&value, vm.ctx.new_str(""))?;
@@ -1899,8 +2022,6 @@ impl ExecutingFrame<'_> {
             Instruction::Nop => Ok(None),
             // NOT_TAKEN is a branch prediction hint - functionally a NOP
             Instruction::NotTaken => Ok(None),
-            // Instrumented version of NOT_TAKEN - NOP without monitoring
-            Instruction::InstrumentedNotTaken => Ok(None),
             // CACHE is used by adaptive interpreter for inline caching - NOP for us
             Instruction::Cache => Ok(None),
             Instruction::ReturnGenerator => {
@@ -1967,16 +2088,25 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             Instruction::RaiseVarargs { kind } => self.execute_raise(vm, kind.get(arg)),
-            Instruction::Resume { arg: resume_arg } => {
-                // Resume execution after yield, await, or at function start
-                // In CPython, this checks instrumentation and eval breaker
-                // For now, we just check for signals/interrupts
-                let _resume_type = resume_arg.get(arg);
-
-                // Check for interrupts if not resuming from yield_from
-                // if resume_type < bytecode::ResumeType::AfterYieldFrom as u32 {
-                //     vm.check_signals()?;
-                // }
+            Instruction::Resume { .. } => {
+                // Check if bytecode needs re-instrumentation
+                let global_ver = vm
+                    .state
+                    .instrumentation_version
+                    .load(atomic::Ordering::Acquire);
+                let code_ver = self
+                    .code
+                    .instrumentation_version
+                    .load(atomic::Ordering::Acquire);
+                if code_ver != global_ver {
+                    let events = vm.state.monitoring_events.load();
+                    crate::stdlib::sys::monitoring::instrument_code(self.code, events);
+                    self.code
+                        .instrumentation_version
+                        .store(global_ver, atomic::Ordering::Release);
+                    // Re-execute this instruction (it may now be INSTRUMENTED_RESUME)
+                    self.update_lasti(|i| *i -= 1);
+                }
                 Ok(None)
             }
             Instruction::ReturnValue => {
@@ -2308,6 +2438,364 @@ impl ExecutingFrame<'_> {
                 self.push_value(vm.ctx.new_bool(!value).into());
                 Ok(None)
             }
+            // All INSTRUMENTED_* opcodes delegate to a cold function to keep
+            // the hot instruction loop free of monitoring overhead.
+            _ => self.execute_instrumented(instruction, arg, vm),
+        }
+    }
+
+    /// Handle all INSTRUMENTED_* opcodes. This function is cold — it only
+    /// runs when sys.monitoring has rewritten the bytecode.
+    #[cold]
+    fn execute_instrumented(
+        &mut self,
+        instruction: Instruction,
+        arg: bytecode::OpArg,
+        vm: &VirtualMachine,
+    ) -> FrameResult {
+        debug_assert!(
+            instruction.is_instrumented(),
+            "execute_instrumented called with non-instrumented opcode {instruction:?}"
+        );
+        self.monitoring_mask = vm.state.monitoring_events.load();
+        use crate::stdlib::sys::monitoring;
+        match instruction {
+            Instruction::InstrumentedResume => {
+                // Version check: re-instrument if stale
+                let global_ver = vm
+                    .state
+                    .instrumentation_version
+                    .load(atomic::Ordering::Acquire);
+                let code_ver = self
+                    .code
+                    .instrumentation_version
+                    .load(atomic::Ordering::Acquire);
+                if code_ver != global_ver {
+                    let events = vm.state.monitoring_events.load();
+                    monitoring::instrument_code(self.code, events);
+                    self.code
+                        .instrumentation_version
+                        .store(global_ver, atomic::Ordering::Release);
+                    // Re-execute (may have been de-instrumented to base Resume)
+                    self.update_lasti(|i| *i -= 1);
+                    return Ok(None);
+                }
+                let resume_type = u32::from(arg);
+                let offset = (self.lasti() - 1) * 2;
+                if resume_type == 0 {
+                    if self.monitoring_mask & monitoring::EVENT_PY_START != 0 {
+                        monitoring::fire_py_start(vm, self.code, offset)?;
+                    }
+                } else if self.monitoring_mask & monitoring::EVENT_PY_RESUME != 0 {
+                    monitoring::fire_py_resume(vm, self.code, offset)?;
+                }
+                Ok(None)
+            }
+            Instruction::InstrumentedReturnValue => {
+                let value = self.pop_value();
+                if self.monitoring_mask & monitoring::EVENT_PY_RETURN != 0 {
+                    let offset = (self.lasti() - 1) * 2;
+                    monitoring::fire_py_return(vm, self.code, offset, &value)?;
+                }
+                self.unwind_blocks(vm, UnwindReason::Returning { value })
+            }
+            Instruction::InstrumentedYieldValue => {
+                let value = self.pop_value();
+                if self.monitoring_mask & monitoring::EVENT_PY_YIELD != 0 {
+                    let offset = (self.lasti() - 1) * 2;
+                    monitoring::fire_py_yield(vm, self.code, offset, &value)?;
+                }
+                let oparg = u32::from(arg);
+                let wrap = oparg == 0;
+                let value = if wrap && self.code.flags.contains(bytecode::CodeFlags::COROUTINE) {
+                    PyAsyncGenWrappedValue(value).into_pyobject(vm)
+                } else {
+                    value
+                };
+                Ok(Some(ExecutionResult::Yield(value)))
+            }
+            Instruction::InstrumentedCall => {
+                let args = self.collect_positional_args(u32::from(arg));
+                self.execute_call_instrumented(args, vm)
+            }
+            Instruction::InstrumentedCallKw => {
+                let args = self.collect_keyword_args(u32::from(arg));
+                self.execute_call_instrumented(args, vm)
+            }
+            Instruction::InstrumentedCallFunctionEx => {
+                let args = self.collect_ex_args(vm)?;
+                self.execute_call_instrumented(args, vm)
+            }
+            Instruction::InstrumentedLoadSuperAttr => {
+                let oparg = bytecode::LoadSuperAttr::from(u32::from(arg));
+                let offset = (self.lasti() - 1) * 2;
+                // Fire CALL event before super() call
+                let call_args = if self.monitoring_mask & monitoring::EVENT_CALL != 0 {
+                    let global_super: PyObjectRef = self.nth_value(2).to_owned();
+                    let arg0 = if oparg.has_class() {
+                        self.nth_value(1).to_owned()
+                    } else {
+                        monitoring::get_missing(vm)
+                    };
+                    monitoring::fire_call(vm, self.code, offset, &global_super, arg0.clone())?;
+                    Some((global_super, arg0))
+                } else {
+                    None
+                };
+                match self.load_super_attr(vm, oparg) {
+                    Ok(result) => {
+                        // Fire C_RETURN on success
+                        if let Some((global_super, arg0)) = call_args {
+                            monitoring::fire_c_return(vm, self.code, offset, &global_super, arg0)?;
+                        }
+                        Ok(result)
+                    }
+                    Err(exc) => {
+                        // Fire C_RAISE on failure
+                        if let Some((global_super, arg0)) = call_args {
+                            let _ = monitoring::fire_c_raise(
+                                vm,
+                                self.code,
+                                offset,
+                                &global_super,
+                                arg0,
+                            );
+                        }
+                        Err(exc)
+                    }
+                }
+            }
+            Instruction::InstrumentedJumpForward => {
+                let src_offset = (self.lasti() - 1) * 2;
+                let target = bytecode::Label::from(u32::from(arg));
+                self.jump(target);
+                if self.monitoring_mask & monitoring::EVENT_JUMP != 0 {
+                    monitoring::fire_jump(vm, self.code, src_offset, target.0 * 2)?;
+                }
+                Ok(None)
+            }
+            Instruction::InstrumentedJumpBackward => {
+                let src_offset = (self.lasti() - 1) * 2;
+                let dest = bytecode::Label::from(u32::from(arg));
+                self.jump(dest);
+                if self.monitoring_mask & monitoring::EVENT_JUMP != 0 {
+                    monitoring::fire_jump(vm, self.code, src_offset, dest.0 * 2)?;
+                }
+                Ok(None)
+            }
+            Instruction::InstrumentedForIter => {
+                let src_offset = (self.lasti() - 1) * 2;
+                let target = bytecode::Label::from(u32::from(arg));
+                let continued = self.execute_for_iter(vm, target)?;
+                if continued {
+                    if self.monitoring_mask & monitoring::EVENT_BRANCH_LEFT != 0 {
+                        let dest_offset = self.lasti() * 2;
+                        monitoring::fire_branch_left(vm, self.code, src_offset, dest_offset)?;
+                    }
+                } else if self.monitoring_mask & monitoring::EVENT_BRANCH_RIGHT != 0 {
+                    let dest_offset = self.lasti() * 2;
+                    monitoring::fire_branch_right(vm, self.code, src_offset, dest_offset)?;
+                }
+                Ok(None)
+            }
+            Instruction::InstrumentedEndFor => {
+                // Stack: [value, receiver(iter), ...]
+                // PyGen_Check: only fire STOP_ITERATION for generators
+                let is_gen = self
+                    .nth_value(1)
+                    .downcast_ref::<crate::builtins::PyGenerator>()
+                    .is_some();
+                let value = self.pop_value();
+                if is_gen && self.monitoring_mask & monitoring::EVENT_STOP_ITERATION != 0 {
+                    let offset = (self.lasti() - 1) * 2;
+                    monitoring::fire_stop_iteration(vm, self.code, offset, &value)?;
+                }
+                Ok(None)
+            }
+            Instruction::InstrumentedEndSend => {
+                let value = self.pop_value();
+                let receiver = self.pop_value();
+                // PyGen_Check || PyCoro_CheckExact
+                let is_gen_or_coro = receiver
+                    .downcast_ref::<crate::builtins::PyGenerator>()
+                    .is_some()
+                    || receiver
+                        .downcast_ref::<crate::builtins::PyCoroutine>()
+                        .is_some();
+                if is_gen_or_coro && self.monitoring_mask & monitoring::EVENT_STOP_ITERATION != 0 {
+                    let offset = (self.lasti() - 1) * 2;
+                    monitoring::fire_stop_iteration(vm, self.code, offset, &value)?;
+                }
+                self.push_value(value);
+                Ok(None)
+            }
+            Instruction::InstrumentedPopJumpIfTrue => {
+                let src_offset = (self.lasti() - 1) * 2;
+                let target = bytecode::Label::from(u32::from(arg));
+                let obj = self.pop_value();
+                let value = obj.try_to_bool(vm)?;
+                if value {
+                    self.jump(target);
+                    if self.monitoring_mask & monitoring::EVENT_BRANCH_RIGHT != 0 {
+                        monitoring::fire_branch_right(vm, self.code, src_offset, target.0 * 2)?;
+                    }
+                }
+                Ok(None)
+            }
+            Instruction::InstrumentedPopJumpIfFalse => {
+                let src_offset = (self.lasti() - 1) * 2;
+                let target = bytecode::Label::from(u32::from(arg));
+                let obj = self.pop_value();
+                let value = obj.try_to_bool(vm)?;
+                if !value {
+                    self.jump(target);
+                    if self.monitoring_mask & monitoring::EVENT_BRANCH_RIGHT != 0 {
+                        monitoring::fire_branch_right(vm, self.code, src_offset, target.0 * 2)?;
+                    }
+                }
+                Ok(None)
+            }
+            Instruction::InstrumentedPopJumpIfNone => {
+                let src_offset = (self.lasti() - 1) * 2;
+                let value = self.pop_value();
+                let target = bytecode::Label::from(u32::from(arg));
+                if vm.is_none(&value) {
+                    self.jump(target);
+                    if self.monitoring_mask & monitoring::EVENT_BRANCH_RIGHT != 0 {
+                        monitoring::fire_branch_right(vm, self.code, src_offset, target.0 * 2)?;
+                    }
+                }
+                Ok(None)
+            }
+            Instruction::InstrumentedPopJumpIfNotNone => {
+                let src_offset = (self.lasti() - 1) * 2;
+                let value = self.pop_value();
+                let target = bytecode::Label::from(u32::from(arg));
+                if !vm.is_none(&value) {
+                    self.jump(target);
+                    if self.monitoring_mask & monitoring::EVENT_BRANCH_RIGHT != 0 {
+                        monitoring::fire_branch_right(vm, self.code, src_offset, target.0 * 2)?;
+                    }
+                }
+                Ok(None)
+            }
+            Instruction::InstrumentedNotTaken => {
+                if self.monitoring_mask & monitoring::EVENT_BRANCH_LEFT != 0 {
+                    let offset = (self.lasti() - 1) * 2;
+                    let dest_offset = self.lasti() * 2;
+                    monitoring::fire_branch_left(
+                        vm,
+                        self.code,
+                        offset.saturating_sub(2),
+                        dest_offset,
+                    )?;
+                }
+                Ok(None)
+            }
+            Instruction::InstrumentedPopIter => {
+                // BRANCH_RIGHT is fired by InstrumentedForIter, not here.
+                self.pop_value();
+                Ok(None)
+            }
+            Instruction::InstrumentedEndAsyncFor => {
+                if self.monitoring_mask & monitoring::EVENT_BRANCH_RIGHT != 0 {
+                    let oparg_val = u32::from(arg);
+                    // src = next_instr - oparg (END_SEND position)
+                    let src_offset = (self.lasti() - oparg_val) * 2;
+                    // dest = this_instr + 1
+                    let dest_offset = self.lasti() * 2;
+                    monitoring::fire_branch_right(vm, self.code, src_offset, dest_offset)?;
+                }
+                let exc = self.pop_value();
+                let _awaitable = self.pop_value();
+                let exc = exc
+                    .downcast::<PyBaseException>()
+                    .expect("EndAsyncFor expects exception on stack");
+                if exc.fast_isinstance(vm.ctx.exceptions.stop_async_iteration) {
+                    vm.set_exception(None);
+                    Ok(None)
+                } else {
+                    Err(exc)
+                }
+            }
+            Instruction::InstrumentedLine => {
+                let idx = self.lasti() as usize - 1;
+                let offset = idx as u32 * 2;
+
+                // Read the full side-table chain before firing any events,
+                // because a callback may de-instrument and clear the tables.
+                let (real_op_byte, also_instruction) = {
+                    let data = self.code.monitoring_data.lock();
+                    let line_op = data.as_ref().map(|d| d.line_opcodes[idx]).unwrap_or(0);
+                    if line_op == u8::from(Instruction::InstrumentedInstruction) {
+                        // LINE wraps INSTRUCTION: resolve the INSTRUCTION side-table too
+                        let inst_op = data
+                            .as_ref()
+                            .map(|d| d.per_instruction_opcodes[idx])
+                            .unwrap_or(0);
+                        (inst_op, true)
+                    } else {
+                        (line_op, false)
+                    }
+                };
+                debug_assert!(
+                    real_op_byte != 0,
+                    "INSTRUMENTED_LINE at {idx} without stored opcode"
+                );
+
+                // Fire LINE event only if line changed
+                if let Some((loc, _)) = self.code.locations.get(idx) {
+                    let line = loc.line.get() as u32;
+                    if line != self.prev_line && line > 0 {
+                        self.prev_line = line;
+                        monitoring::fire_line(vm, self.code, offset, line)?;
+                    }
+                }
+
+                // If the LINE position also had INSTRUCTION, fire that event too
+                if also_instruction {
+                    monitoring::fire_instruction(vm, self.code, offset)?;
+                }
+
+                // Re-dispatch to the real original opcode
+                let original_op = Instruction::try_from(real_op_byte)
+                    .expect("invalid opcode in side-table chain");
+                if original_op.to_base().is_some() {
+                    self.execute_instrumented(original_op, arg, vm)
+                } else {
+                    let mut do_extend_arg = false;
+                    self.execute_instruction(original_op, arg, &mut do_extend_arg, vm)
+                }
+            }
+            Instruction::InstrumentedInstruction => {
+                let idx = self.lasti() as usize - 1;
+                let offset = idx as u32 * 2;
+
+                // Get original opcode from side-table
+                let original_op_byte = {
+                    let data = self.code.monitoring_data.lock();
+                    data.as_ref()
+                        .map(|d| d.per_instruction_opcodes[idx])
+                        .unwrap_or(0)
+                };
+                debug_assert!(
+                    original_op_byte != 0,
+                    "INSTRUMENTED_INSTRUCTION at {idx} without stored opcode"
+                );
+
+                // Fire INSTRUCTION event
+                monitoring::fire_instruction(vm, self.code, offset)?;
+
+                // Re-dispatch to original opcode
+                let original_op = Instruction::try_from(original_op_byte)
+                    .expect("invalid opcode in instruction side-table");
+                if original_op.to_base().is_some() {
+                    self.execute_instrumented(original_op, arg, vm)
+                } else {
+                    let mut do_extend_arg = false;
+                    self.execute_instruction(original_op, arg, &mut do_extend_arg, vm)
+                }
+            }
             _ => {
                 unreachable!("{instruction:?} instruction should not be executed")
             }
@@ -2529,6 +3017,23 @@ impl ExecutingFrame<'_> {
                 if let Some(entry) =
                     bytecode::find_exception_handler(&self.code.exceptiontable, offset)
                 {
+                    // Fire EXCEPTION_HANDLED before setting up handler.
+                    // If the callback raises, the handler is NOT set up and the
+                    // new exception propagates instead.
+                    if vm.state.monitoring_events.load()
+                        & crate::stdlib::sys::monitoring::EVENT_EXCEPTION_HANDLED
+                        != 0
+                    {
+                        let byte_offset = offset * 2;
+                        let exc_obj: PyObjectRef = exception.clone().into();
+                        crate::stdlib::sys::monitoring::fire_exception_handled(
+                            vm,
+                            self.code,
+                            byte_offset,
+                            &exc_obj,
+                        )?;
+                    }
+
                     // 1. Pop stack to entry.depth
                     while self.state.stack.len() > entry.depth as usize {
                         self.state.stack.pop();
@@ -2733,9 +3238,7 @@ impl ExecutingFrame<'_> {
         let self_or_null = self.pop_value_opt(); // Option<PyObjectRef>
         let callable = self.pop_value();
 
-        // If self_or_null is Some (not NULL), prepend it to args
         let final_args = if let Some(self_val) = self_or_null {
-            // Method call: prepend self to args
             let mut all_args = vec![self_val];
             all_args.extend(args.args);
             FuncArgs {
@@ -2743,13 +3246,74 @@ impl ExecutingFrame<'_> {
                 kwargs: args.kwargs,
             }
         } else {
-            // Regular attribute call: self_or_null is NULL
             args
         };
 
         let value = callable.call(final_args, vm)?;
         self.push_value(value);
         Ok(None)
+    }
+
+    /// Instrumented version of execute_call: fires CALL, C_RETURN, and C_RAISE events.
+    fn execute_call_instrumented(&mut self, args: FuncArgs, vm: &VirtualMachine) -> FrameResult {
+        use crate::stdlib::sys::monitoring;
+
+        let self_or_null = self.pop_value_opt();
+        let callable = self.pop_value();
+
+        let final_args = if let Some(self_val) = self_or_null {
+            let mut all_args = vec![self_val];
+            all_args.extend(args.args);
+            FuncArgs {
+                args: all_args,
+                kwargs: args.kwargs,
+            }
+        } else {
+            args
+        };
+
+        let is_python_call = callable.downcast_ref::<PyFunction>().is_some();
+
+        // Fire CALL event
+        let call_arg0 = if self.monitoring_mask & monitoring::EVENT_CALL != 0 {
+            let arg0 = final_args
+                .args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| monitoring::get_missing(vm));
+            let offset = (self.lasti() - 1) * 2;
+            monitoring::fire_call(vm, self.code, offset, &callable, arg0.clone())?;
+            Some(arg0)
+        } else {
+            None
+        };
+
+        match callable.call(final_args, vm) {
+            Ok(value) => {
+                if let Some(arg0) = call_arg0
+                    && !is_python_call
+                {
+                    let offset = (self.lasti() - 1) * 2;
+                    monitoring::fire_c_return(vm, self.code, offset, &callable, arg0)?;
+                }
+                self.push_value(value);
+                Ok(None)
+            }
+            Err(exc) => {
+                let exc = if let Some(arg0) = call_arg0
+                    && !is_python_call
+                {
+                    let offset = (self.lasti() - 1) * 2;
+                    match monitoring::fire_c_raise(vm, self.code, offset, &callable, arg0) {
+                        Ok(()) => exc,
+                        Err(monitor_exc) => monitor_exc,
+                    }
+                } else {
+                    exc
+                };
+                Err(exc)
+            }
+        }
     }
 
     fn execute_raise(&mut self, vm: &VirtualMachine, kind: bytecode::RaiseKind) -> FrameResult {
@@ -2893,42 +3457,40 @@ impl ExecutingFrame<'_> {
         Ok(None)
     }
 
-    /// The top of stack contains the iterator, lets push it forward
-    fn execute_for_iter(&mut self, vm: &VirtualMachine, target: bytecode::Label) -> FrameResult {
+    /// Advance the iterator on top of stack.
+    /// Returns `true` if iteration continued (item pushed), `false` if exhausted (jumped).
+    fn execute_for_iter(
+        &mut self,
+        vm: &VirtualMachine,
+        target: bytecode::Label,
+    ) -> Result<bool, PyBaseExceptionRef> {
         let top_of_stack = PyIter::new(self.top_value());
         let next_obj = top_of_stack.next(vm);
 
-        // Check the next object:
         match next_obj {
             Ok(PyIterReturn::Return(value)) => {
                 self.push_value(value);
-                Ok(None)
+                Ok(true)
             }
             Ok(PyIterReturn::StopIteration(_)) => {
-                // Check if target instruction is END_FOR (CPython 3.14 pattern)
-                // If so, skip it and jump to target + 1 instruction (POP_ITER)
+                // Skip END_FOR (base or instrumented) and jump to POP_ITER.
                 let target_idx = target.0 as usize;
                 let jump_target = if let Some(unit) = self.code.instructions.get(target_idx) {
-                    if matches!(unit.op, bytecode::Instruction::EndFor)
-                        && matches!(
-                            self.code.instructions.get(target_idx + 1).map(|u| &u.op),
-                            Some(bytecode::Instruction::PopIter)
-                        )
-                    {
-                        // Skip END_FOR, jump to POP_ITER
+                    if matches!(
+                        unit.op,
+                        bytecode::Instruction::EndFor | bytecode::Instruction::InstrumentedEndFor
+                    ) {
                         bytecode::Label(target.0 + 1)
                     } else {
-                        // Legacy pattern: jump directly to target (POP_TOP/POP_ITER)
                         target
                     }
                 } else {
                     target
                 };
                 self.jump(jump_target);
-                Ok(None)
+                Ok(false)
             }
             Err(next_error) => {
-                // On error, pop iterator and propagate
                 self.pop_value();
                 Err(next_error)
             }

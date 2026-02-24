@@ -71,6 +71,38 @@ impl Frame {
         }
     }
 
+    #[pygetset(setter)]
+    fn set_f_lineno(&self, value: PySetterValue, vm: &VirtualMachine) -> PyResult<()> {
+        let target_line = match value {
+            PySetterValue::Assign(val) => {
+                let line_ref: PyIntRef = val
+                    .downcast()
+                    .map_err(|_| vm.new_value_error("lineno must be an integer".to_owned()))?;
+                line_ref
+                    .try_to_primitive::<usize>(vm)
+                    .map_err(|_| vm.new_value_error("lineno must be an integer".to_owned()))?
+            }
+            PySetterValue::Delete => {
+                return Err(vm.new_type_error("can't delete f_lineno attribute".to_owned()));
+            }
+        };
+
+        let target_idx = self
+            .code
+            .locations
+            .iter()
+            .position(|(loc, _)| loc.line.get() == target_line);
+
+        if let Some(idx) = target_idx {
+            self.set_lasti(idx as u32);
+            Ok(())
+        } else {
+            Err(vm.new_value_error(format!(
+                "line {target_line} comes after the current code block"
+            )))
+        }
+    }
+
     #[pygetset]
     fn f_trace(&self) -> PyObjectRef {
         let boxed = self.trace.lock();

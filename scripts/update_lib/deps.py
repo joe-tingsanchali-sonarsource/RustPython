@@ -811,6 +811,10 @@ TEST_DEPENDENCIES = {
     "test_makefile": {
         "data": ["wheeldata"],
     },
+    # profilee is used by test_monitoring
+    "test_monitoring": {
+        "hard_deps": ["profilee"],
+    },
 }
 
 

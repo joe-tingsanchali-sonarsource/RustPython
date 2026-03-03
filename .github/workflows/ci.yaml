@@ -353,7 +353,7 @@ jobs:
       - name: Generate coverage report
         run: cargo llvm-cov report --release --lcov --output-path=codecov.lcov
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-${{ matrix.os }}
           path: ./codecov.lcov
